@@ -17,7 +17,7 @@ def collate_batch(batch: List[Tuple[Image.Image, str]]):
     images, captions = zip(*batch)
     return list(images), list(captions)
 
-def init_models(clip_model_name: str, device: torch.device):
+def init_models(clip_model_name: str, device: torch.device, device_ids=None):
     """Load CLIP components and return processor, clip_model, text_model, tokenizer.
 
     We use:
@@ -32,11 +32,11 @@ def init_models(clip_model_name: str, device: torch.device):
     
     # clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
     clip_model = CLIPModel.from_pretrained(clip_model_name)
-    clip_model = send_to_gpus(clip_model)
+    clip_model = send_to_gpus(clip_model, device, device_ids=device_ids)
     tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
     # text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device)
     text_model = CLIPTextModel.from_pretrained(clip_model_name)
-    text_model = send_to_gpus(text_model)
+    text_model = send_to_gpus(text_model, device, device_ids=device_ids)
 
     # Freeze CLIP weights
     clip_model.eval()
@@ -63,10 +63,20 @@ def init_models(clip_model_name: str, device: torch.device):
 
     return processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim
 
-def send_to_gpus(model):
-    if device == 'cuda' and torch.cuda.device_count() > 1:
-        device_ids = [2, 3, 4]  # list of GPU indices
-        model = nn.DataParallel(model, device_ids=device_ids)
+def send_to_gpus(model, device, device_ids=None):
+    # Wrap model in DataParallel only when CUDA and multiple GPUs are available.
+    if str(device).startswith("cuda") and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        # device_ids can be provided as a list of ints; otherwise use all available GPUs
+        if device_ids:
+            # ensure ints
+            dev_ids = [int(x) for x in device_ids]
+        else:
+            dev_ids = list(range(torch.cuda.device_count()))
+        try:
+            model = nn.DataParallel(model, device_ids=dev_ids)
+        except Exception:
+            # fallback: don't wrap
+            pass
     model.to(device)
     return model
 
@@ -82,6 +92,7 @@ def train_mapper(
     num_layers: int = 3,
     save_every: int = 1,
     prefix: str = "laion_subset",
+    device_ids=None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -102,14 +113,25 @@ def train_mapper(
     )
 
     # init models
-    processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim = init_models(clip_model_name, device)
+    processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim = init_models(clip_model_name, device, device_ids=device_ids)
 
     # create mapper
     mapper = ImageToTextMapper(in_dim=in_dim, out_seq_len=out_seq_len, out_dim=out_dim, hidden_dim=hidden_dim, num_layers=num_layers)
-    # Use all available GPUs
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for DataParallel")
-        mapper = nn.DataParallel(mapper, device_ids = [2, 3, 4])
+    # Use DataParallel if requested/available
+    if device_ids and len(device_ids) > 1:
+        print(f"Using device_ids={device_ids} for DataParallel")
+        try:
+            mapper = nn.DataParallel(mapper, device_ids=device_ids)
+        except Exception as e:
+            print(f"Warning: failed to wrap mapper in DataParallel: {e}")
+    elif torch.cuda.device_count() > 1 and (not device_ids):
+        # default: use all GPUs
+        devs = list(range(torch.cuda.device_count()))
+        print(f"Using all available GPUs for DataParallel: {devs}")
+        try:
+            mapper = nn.DataParallel(mapper, device_ids=devs)
+        except Exception as e:
+            print(f"Warning: failed to wrap mapper in DataParallel: {e}")
     mapper = mapper.to(device)
 
     # dataset + dataloader
@@ -292,7 +314,7 @@ def generate_variation(
         mapped = mapper(img_feats)  # [1, L, H]
 
     # compute unconditional embeddings (empty prompt) to allow classifier-free guidance
-    uncond_tokens = tokenizer([""], padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
+    uncond_tokens = tokenizer(["add green color shades to the eye"], padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
     uncond_input_ids = uncond_tokens.input_ids.to(device)
     uncond_attn = uncond_tokens.attention_mask.to(device)
     with torch.no_grad():
@@ -396,6 +418,9 @@ def parse_cli():
     p.add_argument("--hidden_dim", type=int, default=4096)
     p.add_argument("--num_layers", type=int, default=3)
     p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
+    # GPU selection: either a short form --gpus (number) or explicit --device_ids '0,1'
+    p.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (optional)")
+    p.add_argument("--device_ids", type=str, default=None, help="Comma-separated list of GPU device ids to use, e.g. '0,1,2'")
     # generation args
     p.add_argument("--mapper", help="Path to trained mapper (.pth) (for gen mode)")
     p.add_argument("--input_image", help="Input image path (for gen mode)")
@@ -434,6 +459,14 @@ if __name__ == "__main__":
     args = get_args(args_dict)
     device = torch.device(args.device)
 
+    # Parse device ids
+    device_ids = None
+    if getattr(args, 'device_ids', None):
+        device_ids = [int(x.strip()) for x in args.device_ids.split(',') if x.strip()]
+    elif getattr(args, 'gpus', None):
+        # use first N GPUs
+        device_ids = list(range(args.gpus))
+
     if getattr(args, "mode", None) == "train":
         if not hasattr(args, "dataset"):
             raise ValueError("'dataset' is required for training mode")
@@ -447,6 +480,7 @@ if __name__ == "__main__":
             lr=args.lr,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
+            device_ids=device_ids,
         )
     elif getattr(args, "mode", None) == "gen":
         if not hasattr(args, "mapper") or not hasattr(args, "input_image"):

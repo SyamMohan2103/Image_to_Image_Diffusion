@@ -11,7 +11,6 @@ This repository implements a small "mapper" model that converts an input image i
 ## Contents
 
 - `data_download.py` — streaming LAION downloader (saves images + captions into Excel batches).
-- `image_to_text_mapper.py` — mapper model definition and dataset utilities.
 - `run_mapper.py` — training and generation entrypoint (train/generate modes).
 - `laion_images/`, `laion_images_filtered/`, `laion_subset_batch*.xlsx` — sample data and saved batches.
 - `mapper_ckpt/` — where mapper checkpoints are stored.
