@@ -66,3 +66,17 @@ Extending the mapper
 - Try multi-scale conditioning: map different image scales to different segments of the text embedding and concatenate.
 - Train a conditional mapper that takes both image and a short prompt to guide style.
 - Fine-tune the mapper with additional perceptual or adversarial losses for higher visual fidelity.
+
+
+## Monitoring
+
+1. Train with TensorBoard (compound):
+In VS Code Run view, choose "Train + TensorBoard" and start. It will activate the env, run TensorBoard, and launch training.
+2. Or start TensorBoard manually:
+python run_tensorboard.py --logdir ./mapper_ckpt/tb_logs --port 6006
+3. Or simply: tensorboard --logdir ./mapper_ckpt/tb_logs
+Open http://localhost:6006 to view:
+Graph (model)
+Scalars (loss)
+Histograms (input features, predictions)
+Images (generated variation)
