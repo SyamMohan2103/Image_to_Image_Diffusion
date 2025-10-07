@@ -11,6 +11,7 @@ import wandb
 from mapper_model import ImageToTextMapper
 from laion_dataset import ImageCaptionDataset
 from typing import List, Tuple
+from torch.utils.tensorboard import SummaryWriter
 
 
 def collate_batch(batch: List[Tuple[Image.Image, str]]):
@@ -30,13 +31,16 @@ def init_models(clip_model_name: str, device: torch.device, device_ids=None):
     processor = CLIPProcessor.from_pretrained(clip_model_name)
     
     
-    # clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
-    clip_model = CLIPModel.from_pretrained(clip_model_name)
-    clip_model = send_to_gpus(clip_model, device, device_ids=device_ids)
+    # Load CLIP image encoder and place it on the target device.
+    # Do NOT wrap CLIPModel in DataParallel because DataParallel does not
+    # proxy custom methods like `get_image_features` — that causes
+    # AttributeError when calling clip_model.get_image_features.
+    clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
     tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
-    # text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device)
-    text_model = CLIPTextModel.from_pretrained(clip_model_name)
-    text_model = send_to_gpus(text_model, device, device_ids=device_ids)
+    # Load CLIP text encoder and place it on the target device. Also avoid
+    # wrapping in DataParallel for the same reason as above (we call
+    # text_model(...) and access last_hidden_state).
+    text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device)
 
     # Freeze CLIP weights
     clip_model.eval()
@@ -93,8 +97,13 @@ def train_mapper(
     save_every: int = 1,
     prefix: str = "laion_subset",
     device_ids=None,
+    tb_hist_freq: int = 50,
 ):
     os.makedirs(out_dir, exist_ok=True)
+
+    # TensorBoard writer
+    tb_logdir = os.path.join(out_dir, "tb_logs")
+    writer = SummaryWriter(tb_logdir)
 
     # Initialize wandb
     wandb.init(
@@ -116,7 +125,17 @@ def train_mapper(
     processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim = init_models(clip_model_name, device, device_ids=device_ids)
 
     # create mapper
-    mapper = ImageToTextMapper(in_dim=in_dim, out_seq_len=out_seq_len, out_dim=out_dim, hidden_dim=hidden_dim, num_layers=num_layers)
+    base_mapper = ImageToTextMapper(in_dim=in_dim, out_seq_len=out_seq_len, out_dim=out_dim, hidden_dim=hidden_dim, num_layers=num_layers)
+    # write model graph to TensorBoard (before DataParallel wrapping)
+    try:
+        base_mapper.to(device)
+        dummy_input = torch.randn(1, in_dim, device=device)
+        writer.add_graph(base_mapper, dummy_input)
+        print(f"✅ TensorBoard: model graph written to {tb_logdir}")
+    except Exception as e:
+        print(f"⚠️ Could not write model graph to TensorBoard: {e}")
+
+    mapper = base_mapper
     # Use DataParallel if requested/available
     if device_ids and len(device_ids) > 1:
         print(f"Using device_ids={device_ids} for DataParallel")
@@ -174,6 +193,15 @@ def train_mapper(
             with torch.no_grad():
                 img_feats = clip_model.get_image_features(**img_inputs)  # [B, in_dim]
 
+            # Log input features and shape (throttled)
+            try:
+                step_idx = epoch * 100000 + total_batches
+                if tb_hist_freq and (total_batches % tb_hist_freq == 0):
+                    writer.add_histogram('input/img_feats', img_feats.cpu().detach(), global_step=step_idx)
+                writer.add_text('shapes', f'img_feats: {tuple(img_feats.shape)} -> expected in_dim: {in_dim}', global_step=step_idx)
+            except Exception:
+                pass
+
             # 2) captions -> tokenized -> text encoder outputs (target sequence)
             tokenized = tokenizer(list(captions), padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
             input_ids = tokenized.input_ids.to(device)
@@ -185,6 +213,15 @@ def train_mapper(
             # 3) mapper prediction
             pred = mapper(img_feats)  # [B, L, H]
 
+            # Log prediction histogram and shape (throttled)
+            try:
+                step_idx = epoch * 100000 + total_batches
+                if tb_hist_freq and (total_batches % tb_hist_freq == 0):
+                    writer.add_histogram('output/pred', pred.cpu().detach(), global_step=step_idx)
+                writer.add_text('shapes', f'pred: {tuple(pred.shape)} -> expected (B, {out_seq_len}, {out_dim})', global_step=step_idx)
+            except Exception:
+                pass
+
             # 4) compute masked MSE loss (only over tokens where attention_mask == 1)
             diff2 = (pred - text_embeds).pow(2).mean(dim=-1)  # [B, L]
             masked = diff2 * attention_mask
@@ -194,6 +231,11 @@ def train_mapper(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(mapper.parameters(), 1.0)
             optimizer.step()
+            # Log loss to TensorBoard
+            try:
+                writer.add_scalar('loss/train_masked_mse', loss.item(), epoch * 100000 + total_batches)
+            except Exception:
+                pass
 
             running_loss += loss.item()
             total_batches += 1
@@ -221,6 +263,12 @@ def train_mapper(
     print(f"Saved final mapper to {final_path}")
     wandb.save(final_path)
     wandb.finish()
+    # close TensorBoard writer
+    try:
+        writer.flush()
+        writer.close()
+    except Exception:
+        pass
     return final_path
 
 def generate_variation(
@@ -358,8 +406,17 @@ def generate_variation(
     except Exception:
         # fallback: build PIL from numpy as best effort
         image = Image.fromarray((dec[0] * 255).astype('uint8'))
-
     image.save(out_path)
+
+    # Log generated image to TensorBoard if writer exists in scope (best-effort)
+    try:
+        # Create a temporary writer if the module didn't have one
+        from torch.utils.tensorboard import SummaryWriter
+        tb = SummaryWriter(os.path.join(os.path.dirname(out_dir), "tb_logs"))
+        tb.add_image('gen/variation', transforms.ToTensor()(image), dataformats='CHW')
+        tb.flush(); tb.close()
+    except Exception:
+        pass
     print(f"Saved variation to {out_path}")
     return out_path
 
@@ -378,10 +435,17 @@ def get_args(args_dict=None, **kwargs):
     # Set defaults if not provided
     if not hasattr(args, "clip_model"):
         args.clip_model = "openai/clip-vit-large-patch14"
-    if not hasattr(args, "device"):
-        # args.device = "cuda" if torch.cuda.is_available() else "cpu"
-        args.device = device
-        
+
+    # device should be a string like 'cuda', 'cuda:0' or 'cpu'
+    if not hasattr(args, "device") or args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # GPU selection flags: allow None or explicit values
+    if not hasattr(args, "device_ids"):
+        args.device_ids = None
+    if not hasattr(args, "gpus"):
+        args.gpus = None
+
     if not hasattr(args, "out_dir"):
         args.out_dir = "./mapper_ckpt"
     if not hasattr(args, "epochs"):
@@ -419,7 +483,8 @@ def parse_cli():
     p.add_argument("--num_layers", type=int, default=3)
     p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
     # GPU selection: either a short form --gpus (number) or explicit --device_ids '0,1'
-    p.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (optional)")
+    # Accept as string to avoid argparse int-conversion errors when user passes an empty string
+    p.add_argument("--gpus", type=str, default=None, help="Number of GPUs to use (optional). Provide an integer (e.g. '2') or leave unset.")
     p.add_argument("--device_ids", type=str, default=None, help="Comma-separated list of GPU device ids to use, e.g. '0,1,2'")
     # generation args
     p.add_argument("--mapper", help="Path to trained mapper (.pth) (for gen mode)")
@@ -453,8 +518,22 @@ if __name__ == "__main__":
         "guidance": cli.guidance,
         "strength": cli.strength,
     }
+    # Forward device and GPU selection flags into args
     if cli.device:
         args_dict["device"] = cli.device
+    if getattr(cli, 'device_ids', None):
+        # forward non-empty device_ids string
+        devs = str(cli.device_ids).strip()
+        if devs != "":
+            args_dict["device_ids"] = devs
+    # normalize gpus: accept None or a numeric string; ignore blank strings
+    if getattr(cli, 'gpus', None) is not None:
+        g = str(cli.gpus).strip()
+        if g != "":
+            try:
+                args_dict["gpus"] = int(g)
+            except ValueError:
+                raise ValueError(f"--gpus must be an integer (got {cli.gpus!r})")
 
     args = get_args(args_dict)
     device = torch.device(args.device)
