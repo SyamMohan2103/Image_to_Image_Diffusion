@@ -222,3 +222,5 @@ __marimo__/
 *.png
 *.out
 /tools
+/laion_images_kp
+laion_metadata_kp.jsonl
