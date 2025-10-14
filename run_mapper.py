@@ -8,10 +8,12 @@ from PIL import Image
 from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer, CLIPTextModel
 from diffusers import StableDiffusionPipeline
 import wandb
+from tqdm import tqdm
 from mapper_model import ImageToTextMapper
 from laion_dataset import ImageCaptionDataset
 from typing import List, Tuple
 from torch.utils.tensorboard import SummaryWriter
+from typing import Optional
 
 
 def collate_batch(batch: List[Tuple[Image.Image, str]]):
@@ -98,6 +100,7 @@ def train_mapper(
     prefix: str = "laion_subset",
     device_ids=None,
     tb_hist_freq: int = 50,
+    image_path_prefix: Optional[str] = None
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -154,7 +157,7 @@ def train_mapper(
     mapper = mapper.to(device)
 
     # dataset + dataloader
-    ds = ImageCaptionDataset(dataset_csv, prefix=prefix)
+    ds = ImageCaptionDataset(dataset_csv, image_path_prefix=image_path_prefix)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_batch, num_workers=4)
 
     optimizer = torch.optim.AdamW(mapper.parameters(), lr=lr, weight_decay=0.01)
@@ -167,7 +170,7 @@ def train_mapper(
         total_tokens = 0
         total_batches = 0
 
-        for images, captions in dl:
+        for images, captions in tqdm(dl):
             # images: list[PIL], captions: list[str]
             # Ensure images are RGB
             images = [img.convert("RGB") for img in images]
@@ -475,6 +478,7 @@ def parse_cli():
     # training args
     p.add_argument("--dataset", help="Path to dataset directory or file (for train mode)")
     p.add_argument("--prefix", default="laion_subset", help="Batch prefix when scanning a directory")
+    p.add_argument("--image_path_prefix", default=None, help="Optional prefix path to prepend to image paths in the dataset CSV")
     p.add_argument("--out_dir", default="./mapper_ckpt", help="Output directory for checkpoints / outputs")
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=8)
@@ -504,6 +508,7 @@ if __name__ == "__main__":
         "mode": cli.mode,
         "dataset": cli.dataset,
         "prefix": cli.prefix,
+        "image_path_prefix": cli.image_path_prefix,
         "out_dir": cli.out_dir,
         "epochs": cli.epochs,
         "batch_size": cli.batch_size,
@@ -560,6 +565,7 @@ if __name__ == "__main__":
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             device_ids=device_ids,
+            image_path_prefix=args.image_path_prefix
         )
     elif getattr(args, "mode", None) == "gen":
         if not hasattr(args, "mapper") or not hasattr(args, "input_image"):
