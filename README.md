@@ -52,6 +52,9 @@ Example command:
 ```bash
 python run_mapper.py --mode gen --mapper ./mapper_ckpt/mapper.pth --input_image input.png --out_dir ./output
 ```
+```bash
+python run_mapper.py --mode train --dataset /home1/koustav/Image_to_Image_Diffusion/filtered_metadata_parallel.csv --prefix laion_subset --image_path_prefix /home1/koustav/Image_to_Image_Diffusion/laion_images_kp/ --out_dir /home1/koustav/Image_to_Image_Diffusion/mapper_ckpt --epochs 3 --batch_size 8 --lr 1e-4 --hidden_dim 4096 --num_layers 3 --clip_model openai/clip-vit-large-patch14 --gpus "" --device_ids 2,3,4 --device cuda:2
+```
 
 This will run the mapper on `input.png`, produce the conditioning vector, and run the frozen Stable Diffusion model to produce an output image in `./output`.
 
