@@ -24,6 +24,7 @@ class ImageCaptionDataset(Dataset):
         self,
         dir_or_single_csv: Optional[str] = None,
         *,
+        image_path_prefix: Optional[str] = None,
         prefix: Optional[str] = None,
         files: Optional[List[str]] = None,
         image_col: str = "image_path",
@@ -101,7 +102,11 @@ class ImageCaptionDataset(Dataset):
 
         # Optional: filter out non-existing files to avoid runtime errors
         # Keep rows with existing files; others will be handled at __getitem__
-        self._exists_mask = df[image_col].map(lambda p: isinstance(p, str) and os.path.isfile(p))
+        self.image_path_prefix = image_path_prefix
+        if self.image_path_prefix:
+            self._exists_mask = df[image_col].map(lambda p: isinstance(p, str) and os.path.isfile(os.path.join(self.image_path_prefix, p)))
+        else:
+            self._exists_mask = df[image_col].map(lambda p: isinstance(p, str) and os.path.isfile(p))
         self.df = df.reset_index(drop=True)
         self.image_col = image_col
         self.caption_col = caption_col
@@ -118,6 +123,8 @@ class ImageCaptionDataset(Dataset):
         real_idx = self._indices[idx]
         row = self.df.iloc[real_idx]
         img_path = row[self.image_col]
+        if self.image_path_prefix:
+            img_path = os.path.join(self.image_path_prefix, img_path)
         caption = str(row[self.caption_col])
         try:
             img = Image.open(img_path).convert("RGB")
