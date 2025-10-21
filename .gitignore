@@ -224,3 +224,10 @@ __marimo__/
 /tools
 /laion_images_kp
 laion_metadata_kp.jsonl
+/excel_data_files
+/laion_images_filtered_old
+/laion_images_old
+/test
+.todo
+.gradio/
+*.csv
