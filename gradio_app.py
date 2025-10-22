@@ -70,6 +70,7 @@ def generate_variants(
     steps: int,
     variations: int,
     seed: int,
+    use_source_latents: bool = False,   # <-- added flag
 ) -> List[Image.Image]:
     if image is None:
         return []
@@ -77,8 +78,17 @@ def generate_variants(
     image = image.convert("RGB")
     init_tensor = to_latents(image).unsqueeze(0).to(device=DEVICE, dtype=TORCH_DTYPE)
 
-    latents = pipe.vae.encode(init_tensor).latent_dist.sample()
-    latents = latents * pipe.vae.config.scaling_factor
+    # Encode once to get original latents, then optionally use them or start from random latents
+    with torch.no_grad():
+        latents_orig = pipe.vae.encode(init_tensor).latent_dist.sample()
+        latents_orig = latents_orig * pipe.vae.config.scaling_factor
+
+    if use_source_latents:
+        # img2img behavior: start from encoded image latents
+        latents = latents_orig
+    else:
+        # decoupled behavior: start from random latents of same shape so conditioning doesn't trivially reproduce input
+        latents = torch.randn_like(latents_orig) * pipe.vae.config.scaling_factor
 
     # mapper conditioning
     processed = processor(images=image, return_tensors="pt")
@@ -158,11 +168,13 @@ with gr.Blocks() as demo:
         variations = gr.Slider(1, 6, value=3, step=1, label="Number of variants")
         seed = gr.Number(value=42, precision=0, label="Seed")
 
-    run_btn = gr.Button("Generate")
+    use_src_latents = gr.Checkbox(label="Use source latents (img2img)", value=False, info="If enabled, encode the input image to latents (img2img). Otherwise start from random latents (more diverse outputs).")
 
+    run_btn = gr.Button("Generate")
+    # TODO: fix generation using image latents button input
     run_btn.click(
         fn=generate_variants,
-        inputs=[image_input, prompt, guidance, strength, steps, variations, seed],
+        inputs=[image_input, prompt, guidance, strength, steps, variations, seed, use_src_latents],
         outputs=gallery,
     )
 
