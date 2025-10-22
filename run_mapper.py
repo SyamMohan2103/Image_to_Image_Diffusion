@@ -1,6 +1,9 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
+from pathlib import Path
+from typing import List
 import argparse
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -29,6 +32,11 @@ def collate_batch(batch: List[Tuple[Image.Image, str]]):
 # ==========================================================
 # Model initialization
 # ==========================================================
+def is_main_process() -> bool:
+    """Return True if distributed is not in use, or this is rank 0."""
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
 def init_models(clip_model_name: str, device: torch.device):
     print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Loading CLIP model: {clip_model_name}")
     processor = CLIPProcessor.from_pretrained(clip_model_name)
@@ -53,7 +61,7 @@ def init_models(clip_model_name: str, device: torch.device):
     in_dim = img_feats.shape[-1]
     out_seq_len = tokenizer.model_max_length
     out_dim = text_model.config.hidden_size
-    if dist.get_rank() == 0 or not dist.is_initialized():
+    if is_main_process():
         print(f"in_dim = {in_dim}, out_seq_len = {out_seq_len}, out_dim = {out_dim}")
     return processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim
 
@@ -167,9 +175,30 @@ def train_mapper_ddp(
     dist.destroy_process_group()
 
 
-# ==========================================================
-# Generation (unchanged)
-# ==========================================================
+def _load_mapper(mapper_path: str, device: torch.device):
+    data = torch.load(mapper_path, map_location="cpu")
+    cfg = data.get("config")
+    mapper = ImageToTextMapper(in_dim=cfg["in_dim"], out_seq_len=cfg["out_seq_len"], out_dim=cfg["out_dim"])
+    state = data["state_dict"]
+    # strip DataParallel prefix if present
+    if any(k.startswith("module.") for k in list(state.keys())):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    mapper.load_state_dict(state)
+    mapper.to(device).eval()
+    return mapper, cfg
+
+
+def _prepare_image(img_path: str):
+    img = Image.open(img_path).convert("RGB")
+    img = img.resize((512, 512))
+    preprocess = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+    t = preprocess(img).unsqueeze(0)  # [1,C,H,W]
+    return img, t
+
+
 def generate_variation(
     mapper_path: str,
     clip_model_name: str,
@@ -181,89 +210,93 @@ def generate_variation(
     guidance_scale: float = 3.0,
     strength: float = 0.7,
     seed: int = 42,
-    use_source_latents: bool = False,  # <-- new flag, default False to avoid trivial copies
-):
+    use_source_latents: bool = False,  # keep default for backward compat
+    variations: int = 3,               # <-- added parameter
+) -> List[str]:
+    """
+    Generate image variation(s) using the Stable Diffusion pipeline.
+    The mapper is used only to produce prompt_embeds conditioning for the pipeline.
+    Returns list of saved file paths.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    torch.manual_seed(seed)
+    device = torch.device(device)
 
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
-    clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
+    # choose pipeline dtype (float16 on CUDA for speed)
+    pipe_dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    # load CLIP and text models (kept in float32 for stability)
+    processor = CLIPProcessor.from_pretrained(clip_model_name, use_fast=True)
+    clip_model = CLIPModel.from_pretrained(clip_model_name).to(device).eval()
     tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
-    text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device)
-    clip_model.eval(); text_model.eval()
+    text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device).eval()
     for p in list(clip_model.parameters()) + list(text_model.parameters()):
         p.requires_grad = False
 
-    data = torch.load(mapper_path, map_location=device)
-    cfg = data.get("config")
-    mapper = ImageToTextMapper(in_dim=cfg["in_dim"], out_seq_len=cfg["out_seq_len"], out_dim=cfg["out_dim"]).to(device)
-    state_dict = data["state_dict"]
-    if any(k.startswith("module.") for k in state_dict.keys()):
-        new_state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-        state_dict = new_state_dict
-    mapper.load_state_dict(state_dict)
-    mapper.eval()
+    # load mapper checkpoint
+    mapper, cfg = _load_mapper(mapper_path, device=torch.device("cpu"))
+    mapper.to(device).eval()
 
-    pipe = StableDiffusionPipeline.from_pretrained(sd_model_name, torch_dtype=torch.float16).to(device)
+    # load pipeline
+    pipe = StableDiffusionPipeline.from_pretrained(sd_model_name, torch_dtype=pipe_dtype).to(device)
     pipe.safety_checker = None
     vae, unet, scheduler = pipe.vae, pipe.unet, pipe.scheduler
 
-    img = Image.open(input_image_path).convert("RGB").resize((512, 512))
-    preprocess = transforms.Compose([
-        transforms.Resize((512, 512)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3),
-    ])
-    img_tensor = preprocess(img).unsqueeze(0).to(device=device, dtype=torch.float16)
+    # prepare image tensors
+    pil_img, img_tensor = _prepare_image(input_image_path)
+    img_tensor = img_tensor.to(device=device, dtype=torch.float32)  # for CLIP/mapper
 
-    # encode once to get shape & original latents, but optionally ignore them
+    # compute mapped conditioning and uncond embedding
     with torch.no_grad():
-        latents_orig = vae.encode(img_tensor).latent_dist.sample()  # [B, C, H/8, W/8]
-        latents_orig = latents_orig * vae.config.scaling_factor
+        clip_inputs = processor(images=pil_img, return_tensors="pt")
+        clip_inputs = {k: v.to(device) for k, v in clip_inputs.items()}
+        img_feats = clip_model.get_image_features(**clip_inputs)  # float32
+        mapped = mapper(img_feats)  # [1, L, H] float32
 
-    if use_source_latents:
-        # img2img behavior (original): start from encoded image latents
-        latents = latents_orig
-    else:
-        # decoupled behavior: start from random latents of same shape so conditioning doesn't trivially reproduce input
-        latents = torch.randn_like(latents_orig).to(device=device, dtype=latents_orig.dtype) * vae.config.scaling_factor
+        uncond_tokens = tokenizer([""], padding="max_length", truncation=True,
+                                  max_length=tokenizer.model_max_length, return_tensors="pt")
+        uncond_tokens = {k: v.to(device) for k, v in uncond_tokens.items()}
+        uncond_emb = text_model(**uncond_tokens).last_hidden_state  # [1, L, H] float32
 
-    scheduler.set_timesteps(num_inference_steps)
-    init_timestep = int(strength * (num_inference_steps - 1))
-    t = scheduler.timesteps[init_timestep]
-    noise = torch.randn_like(latents)
-    noisy_latents = scheduler.add_noise(latents, noise, t)
+    # align dtype/device for pipeline UNet
+    target_dtype = unet.dtype
+    mapped = mapped.to(device=device, dtype=target_dtype)
+    uncond_emb = uncond_emb.to(device=device, dtype=target_dtype)
 
-    inputs = processor(images=img, return_tensors="pt")
-    img_inputs = {k: v.to(device) for k, v in inputs.items()}
+    # prepare latents (either encoded source or random base — we'll sample per-variation)
     with torch.no_grad():
-        img_feats = clip_model.get_image_features(**img_inputs)
-        mapped = mapper(img_feats)
+        enc_in = img_tensor.to(device=device, dtype=pipe_dtype)
+        latents_orig = vae.encode(enc_in).latent_dist.sample() * vae.config.scaling_factor  # [1, C, H/8, W/8]
 
-    uncond_tokens = tokenizer([""], padding="max_length", truncation=True,
-                              max_length=tokenizer.model_max_length, return_tensors="pt")
-    uncond_emb = text_model(**{k: v.to(device) for k, v in uncond_tokens.items()}).last_hidden_state
-    mapped_emb_cat = torch.cat([uncond_emb, mapped], dim=0)
+    out_paths: List[str] = []
+    for i in range(variations):
+        gen_seed = int(seed) + i
+        generator = torch.Generator(device=device).manual_seed(gen_seed)
 
-    latents = noisy_latents
-    for i, t in enumerate(scheduler.timesteps[init_timestep:]):
-        latent_in = torch.cat([latents] * 2).to(dtype=torch.float16)
-        with torch.no_grad():
-            model_out = unet(latent_in, t, encoder_hidden_states=mapped_emb_cat.to(dtype=torch.float16)).sample
-        eps_uncond, eps_cond = model_out.chunk(2)
-        eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-        latents = scheduler.step(eps, t, latents).prev_sample
+        if use_source_latents:
+            latents = latents_orig.clone().to(device=device, dtype=latents_orig.dtype)
+        else:
+            latents = torch.randn_like(latents_orig, device=device, dtype=latents_orig.dtype)
 
-    with torch.no_grad():
-        latents = latents / vae.config.scaling_factor
-        dec = vae.decode(latents).sample
-    dec = (dec / 2 + 0.5).clamp(0, 1)
-    img_out = transforms.ToPILImage()(dec[0].cpu())
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "variation.png")
-    img_out.save(out_path)
-    print(f"Saved generated variation: {out_path}")
-    return out_path
+        # Run pipeline (it will perform denoising + decode)
+        images = pipe(
+            prompt_embeds=mapped,
+            negative_prompt_embeds=uncond_emb,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            latents=latents,
+            generator=generator,
+            output_type="pil",
+        ).images
+
+        img_out = images[0]
+        out_name = f"variation_{i}_seed{gen_seed}.png"
+        out_path = os.path.join(out_dir, out_name)
+        img_out.save(out_path)
+        out_paths.append(out_path)
+        if is_main_process():
+            print(f"Saved generated variation: {out_path}")
+
+    return out_paths
 
 
 # ==========================================================
@@ -290,6 +323,7 @@ def parse_cli():
     p.add_argument("--strength", type=float, default=0.7)
     p.add_argument("--use_source_latents", action="store_true",
                    help="If set, encode the input image to latents (img2img). Otherwise start from random latents (decoupled).")
+    p.add_argument("--variations", type=int, default=3, help="Number of variants to generate")
     return p.parse_args()
 
 
@@ -328,7 +362,8 @@ def main():
             num_inference_steps=cli.num_inference_steps,
             guidance_scale=cli.guidance,
             strength=cli.strength,
-            use_source_latents=cli.use_source_latents,       
+            use_source_latents=cli.use_source_latents,
+            variations=cli.variations,   # <-- pass CLI value here
         )
 
 if __name__ == "__main__":
