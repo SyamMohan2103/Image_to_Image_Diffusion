@@ -181,6 +181,7 @@ def generate_variation(
     guidance_scale: float = 3.0,
     strength: float = 0.7,
     seed: int = 42,
+    use_source_latents: bool = False,  # <-- new flag, default False to avoid trivial copies
 ):
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(seed)
@@ -214,8 +215,18 @@ def generate_variation(
         transforms.Normalize([0.5]*3, [0.5]*3),
     ])
     img_tensor = preprocess(img).unsqueeze(0).to(device=device, dtype=torch.float16)
+
+    # encode once to get shape & original latents, but optionally ignore them
     with torch.no_grad():
-        latents = vae.encode(img_tensor).latent_dist.sample() * vae.config.scaling_factor
+        latents_orig = vae.encode(img_tensor).latent_dist.sample()  # [B, C, H/8, W/8]
+        latents_orig = latents_orig * vae.config.scaling_factor
+
+    if use_source_latents:
+        # img2img behavior (original): start from encoded image latents
+        latents = latents_orig
+    else:
+        # decoupled behavior: start from random latents of same shape so conditioning doesn't trivially reproduce input
+        latents = torch.randn_like(latents_orig).to(device=device, dtype=latents_orig.dtype) * vae.config.scaling_factor
 
     scheduler.set_timesteps(num_inference_steps)
     init_timestep = int(strength * (num_inference_steps - 1))
@@ -277,6 +288,8 @@ def parse_cli():
     p.add_argument("--num_inference_steps", type=int, default=50)
     p.add_argument("--guidance", type=float, default=3.0)
     p.add_argument("--strength", type=float, default=0.7)
+    p.add_argument("--use_source_latents", action="store_true",
+                   help="If set, encode the input image to latents (img2img). Otherwise start from random latents (decoupled).")
     return p.parse_args()
 
 
@@ -315,8 +328,12 @@ def main():
             num_inference_steps=cli.num_inference_steps,
             guidance_scale=cli.guidance,
             strength=cli.strength,
+            use_source_latents=cli.use_source_latents,       
         )
-
 
 if __name__ == "__main__":
     main()
+    # TODO: train the model with a different loss
+    # TODO: check the cosine similarity between the 2 embeddings
+    # TODO: increase the complexity of the mapper model
+    # TODO: unfreeze some layers of CLIP model
