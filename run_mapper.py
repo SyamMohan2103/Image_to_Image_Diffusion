@@ -19,6 +19,7 @@ from mapper_model import ImageToTextMapper
 from laion_dataset import ImageCaptionDataset
 from typing import List, Tuple, Optional
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 
 # ==========================================================
@@ -65,6 +66,24 @@ def init_models(clip_model_name: str, device: torch.device):
         print(f"in_dim = {in_dim}, out_seq_len = {out_seq_len}, out_dim = {out_dim}")
     return processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim
 
+
+def pooled_from_token_embeddings(token_embeds, attention_mask):
+    # token_embeds: [B, L, H], attention_mask: [B, L]
+    att = attention_mask.unsqueeze(-1).to(token_embeds.dtype)  # [B, L, 1]
+    summed = (token_embeds * att).sum(dim=1)  # [B, H]
+    lengths = att.sum(dim=1).clamp(min=1.0)  # [B, 1]
+    return summed / lengths
+
+
+def info_nce_loss_from_pooled(pred_tokens, target_tokens, attention_mask, temperature=0.07):
+    # Simple InfoNCE using pooled representations; assumes batch negatives
+    p = pooled_from_token_embeddings(pred_tokens, attention_mask)  # [B, H]
+    t = pooled_from_token_embeddings(target_tokens, attention_mask)  # [B, H]
+    p = F.normalize(p, dim=-1)
+    t = F.normalize(t, dim=-1)
+    logits = (p @ t.t()) / temperature  # [B, B]
+    labels = torch.arange(logits.size(0), device=logits.device)
+    return F.cross_entropy(logits, labels)
 
 # ==========================================================
 # DDP training
@@ -137,9 +156,11 @@ def train_mapper_ddp(
                 text_embeds = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
             pred = mapper(img_feats)
-            diff2 = (pred - text_embeds).pow(2).mean(dim=-1)
-            masked = diff2 * attention_mask
-            loss = masked.sum() / (attention_mask.sum() + 1e-8)
+            # diff2 = (pred - text_embeds).pow(2).mean(dim=-1)
+            # masked = diff2 * attention_mask
+            # loss = masked.sum() / (attention_mask.sum() + 1e-8)
+
+            loss = info_nce_loss_from_pooled(pred, text_embeds, attention_mask)
 
             optimizer.zero_grad()
             loss.backward()
@@ -369,6 +390,6 @@ def main():
 if __name__ == "__main__":
     main()
     # TODO: train the model with a different loss
-    # TODO: check the cosine similarity between the 2 embeddings
+    # TODO: check the cosine similarity between the 2 embeddings -----> done
     # TODO: increase the complexity of the mapper model
     # TODO: unfreeze some layers of CLIP model
