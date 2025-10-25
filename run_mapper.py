@@ -199,7 +199,7 @@ def train_mapper_ddp(
 def _load_mapper(mapper_path: str, device: torch.device):
     data = torch.load(mapper_path, map_location="cpu")
     cfg = data.get("config")
-    mapper = ImageToTextMapper(in_dim=cfg["in_dim"], out_seq_len=cfg["out_seq_len"], out_dim=cfg["out_dim"])
+    mapper = ImageToTextMapper(in_dim=cfg["in_dim"], out_seq_len=cfg["out_seq_len"], out_dim=cfg["out_dim"], num_layers=4)
     state = data["state_dict"]
     # strip DataParallel prefix if present
     if any(k.startswith("module.") for k in list(state.keys())):
