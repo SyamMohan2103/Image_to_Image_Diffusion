@@ -82,6 +82,7 @@ def train_mapper_ddp(
     num_layers=3,
     prefix: str = "laion_subset",
     image_path_prefix=None,
+    val_fraction: float = 0.1,
 ):
     # 1. Setup DDP environment
     os.environ["MASTER_ADDR"] = "localhost"
@@ -106,22 +107,46 @@ def train_mapper_ddp(
 
     mapper = nn.parallel.DistributedDataParallel(base_mapper, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
-    # 4. Dataset + Sampler
+    # 4. Dataset + Sampler + split into train/val
     dataset = ImageCaptionDataset(dataset_csv, image_path_prefix=image_path_prefix)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                            collate_fn=collate_batch, num_workers=4, pin_memory=True)
+
+    # create deterministic split (seeded) into train/val
+    total_len = len(dataset)
+    val_len = max(1, int(total_len * float(val_fraction))) if total_len > 1 else 0
+    train_len = total_len - val_len
+    if val_len <= 0:
+        # no validation set (tiny dataset) -> use training only
+        train_dataset = dataset
+        val_dataset = None
+    else:
+        # use random_split with fixed seed for reproducibility across runs
+        generator = torch.Generator()
+        generator.manual_seed(42)
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_len, val_len], generator=generator)
+
+    # Distributed samplers
+    train_sampler = DistributedSampler(train_dataset if val_len > 0 else dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    train_loader = DataLoader(train_dataset if val_len > 0 else dataset, batch_size=batch_size, sampler=train_sampler,
+                              collate_fn=collate_batch, num_workers=4, pin_memory=True)
+
+    if val_len > 0:
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
+                                collate_fn=collate_batch, num_workers=2, pin_memory=True)
+    else:
+        val_loader = None
 
     optimizer = torch.optim.AdamW(mapper.parameters(), lr=lr, weight_decay=0.01)
 
     # 5. Training loop
+    best_val = float("inf")
     for epoch in range(1, epochs + 1):
-        sampler.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
         mapper.train()
         running_loss = 0.0
         total_batches = 0
 
-        for images, captions in tqdm(dataloader, disable=(rank != 0)):
+        for images, captions in tqdm(train_loader, disable=(rank != 0)):
             images = [img.convert("RGB") for img in images]
             inputs = processor(images=images, return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
             img_inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -151,16 +176,73 @@ def train_mapper_ddp(
 
         avg_loss = running_loss / max(1, total_batches)
 
+        # Validation loop (if available)
+        val_loss = None
+        if val_loader is not None:
+            mapper.eval()
+            # accumulate numerator (squared-error sum over valid tokens) and denominator (valid token counts)
+            tot_num = torch.tensor(0.0, device=device)
+            tot_den = torch.tensor(0.0, device=device)
+            with torch.no_grad():
+                # make sure val sampler uses same epoch ordering if desired (no shuffle)
+                for v_images, v_captions in val_loader:
+                    v_images = [img.convert("RGB") for img in v_images]
+                    v_inputs = processor(images=v_images, return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
+                    v_img_inputs = {k: v.to(device) for k, v in v_inputs.items()}
+                    v_img_feats = clip_model.get_image_features(**v_img_inputs)
+
+                    v_tokenized = tokenizer(list(v_captions), padding="max_length", truncation=True,
+                                            max_length=tokenizer.model_max_length, return_tensors="pt")
+                    v_input_ids = v_tokenized.input_ids.to(device)
+                    v_attention_mask = v_tokenized.attention_mask.to(device)
+                    v_text_embeds = text_model(input_ids=v_input_ids, attention_mask=v_attention_mask).last_hidden_state
+
+                    v_pred = mapper(v_img_feats)
+                    v_diff2 = (v_pred - v_text_embeds).pow(2).mean(dim=-1)  # [B, L]
+                    v_masked = v_diff2 * v_attention_mask
+
+                    batch_num = v_masked.sum()  # scalar
+                    batch_den = v_attention_mask.sum()  # scalar
+                    tot_num += batch_num
+                    tot_den += batch_den
+
+            # aggregate across processes
+            if dist.is_initialized():
+                dist.all_reduce(tot_num, op=dist.ReduceOp.SUM)
+                dist.all_reduce(tot_den, op=dist.ReduceOp.SUM)
+
+            val_loss = (tot_num / (tot_den + 1e-8)).item()
+
         # Only rank 0 logs & saves
         if rank == 0:
-            print(f"[Rank 0] Epoch {epoch}/{epochs} — avg masked MSE loss: {avg_loss:.6f}")
-            wandb.log({"epoch": epoch, "avg_loss": avg_loss})
-            ckpt_path = os.path.join(out_dir, f"mapper_epoch{epoch}.pth")
-            torch.save({
-                "state_dict": mapper.module.state_dict(),
-                "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
-            }, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+            if val_loss is None:
+                print(f"[Rank 0] Epoch {epoch}/{epochs} — avg masked MSE loss (train): {avg_loss:.6f}")
+                wandb.log({"epoch": epoch, "train_avg_loss": avg_loss})
+                ckpt_path = os.path.join(out_dir, f"mapper_epoch{epoch}.pth")
+                torch.save({
+                    "state_dict": mapper.module.state_dict(),
+                    "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
+                }, ckpt_path)
+                print(f"Saved checkpoint: {ckpt_path}")
+            else:
+                print(f"[Rank 0] Epoch {epoch}/{epochs} — train_avg: {avg_loss:.6f}, val: {val_loss:.6f}")
+                wandb.log({"epoch": epoch, "train_avg_loss": avg_loss, "val_loss": val_loss})
+                # save every epoch + keep best
+                ckpt_path = os.path.join(out_dir, f"mapper_epoch{epoch}.pth")
+                torch.save({
+                    "state_dict": mapper.module.state_dict(),
+                    "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
+                }, ckpt_path)
+                print(f"Saved checkpoint: {ckpt_path}")
+                # save best
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_path = os.path.join(out_dir, f"mapper_best.pth")
+                    torch.save({
+                        "state_dict": mapper.module.state_dict(),
+                        "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
+                    }, best_path)
+                    print(f"Saved best checkpoint: {best_path} (val_loss={best_val:.6f})")
 
     if rank == 0:
         final_path = os.path.join(out_dir, "mapper_final.pth")
@@ -324,6 +406,7 @@ def parse_cli():
     p.add_argument("--use_source_latents", action="store_true",
                    help="If set, encode the input image to latents (img2img). Otherwise start from random latents (decoupled).")
     p.add_argument("--variations", type=int, default=3, help="Number of variants to generate")
+    p.add_argument("--val_fraction", type=float, default=0.1, help="Fraction of data to use for validation (0-1)")
     return p.parse_args()
 
 
@@ -346,6 +429,7 @@ def main():
                 cli.num_layers,
                 "laion_subset",
                 cli.image_path_prefix,
+                cli.val_fraction,
             ),
             nprocs=n_gpus,
             join=True,
