@@ -21,6 +21,44 @@ from typing import List, Tuple, Optional
 from torch.utils.tensorboard import SummaryWriter
 
 
+def clip_get_image_features(model: torch.nn.Module, **kwargs):
+    """Safe accessor for CLIPModel.get_image_features that works when the model
+    is wrapped in DistributedDataParallel (DDP)."""
+    mod = model.module if hasattr(model, "module") else model
+    return mod.get_image_features(**kwargs)
+
+
+def unfreeze_last_n_transformer_blocks(model: torch.nn.Module, attr_path: str, n_blocks: int) -> int:
+    """Unfreeze the last n transformer blocks found at attr_path inside model.
+
+    Returns the number of blocks actually unfrozen. This helper is defensive about
+    different HF CLIP layouts (e.g., .vision_model.encoder.layer vs .vision_model.encoder.layers).
+    """
+    if n_blocks <= 0:
+        return 0
+    cur = model
+    for name in attr_path.split('.'):
+        if not hasattr(cur, name):
+            return 0
+        cur = getattr(cur, name)
+
+    # Expect cur to be a ModuleList / list-like
+    try:
+        total = len(cur)
+    except Exception:
+        return 0
+
+    start = max(0, total - n_blocks)
+    unfrozen = 0
+    for i in range(start, total):
+        mod = cur[i]
+        for p in mod.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+                unfrozen += 1
+    return unfrozen
+
+
 # ==========================================================
 # Data utilities
 # ==========================================================
@@ -56,7 +94,7 @@ def init_models(clip_model_name: str, device: torch.device):
     inputs = processor(images=dummy_img, return_tensors="pt")
     with torch.no_grad():
         img_inputs = {k: v.to(device) for k, v in inputs.items()}
-        img_feats = clip_model.get_image_features(**img_inputs)
+        img_feats = clip_get_image_features(clip_model, **img_inputs)
 
     in_dim = img_feats.shape[-1]
     out_seq_len = tokenizer.model_max_length
@@ -100,11 +138,44 @@ def train_mapper_ddp(
     # 3. Init CLIP + Mapper
     processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim = init_models(clip_model_name, device)
 
+    # Read unfreeze settings from environment (set by launcher). We support staged unfreeze
+    # controlled by UNFREEZE_AFTER_EPOCH. If UNFREEZE_AFTER_EPOCH > 0, we defer unfreezing until
+    # after that epoch (warm-up). If 0 (default), unfreeze immediately as before.
+    unfreeze_vision_n = int(os.environ.get("UNFREEZE_VISION_N", "0"))
+    unfreeze_text_n = int(os.environ.get("UNFREEZE_TEXT_N", "0"))
+    clip_lr = float(os.environ.get("CLIP_LR", "0.0"))
+    unfreeze_after_epoch = int(os.environ.get("UNFREEZE_AFTER_EPOCH", "0"))
+
+    staged_unfreeze = unfreeze_after_epoch > 0
+    clip_unfrozen_params = []
+    text_unfrozen_params = []
+
+    # If no staged warm-up requested, perform the unfreeze immediately (previous behavior)
+    if not staged_unfreeze:
+        if unfreeze_vision_n > 0:
+            unf = unfreeze_last_n_transformer_blocks(clip_model, "vision_model.encoder.layers", unfreeze_vision_n)
+            if unf == 0:
+                unf = unfreeze_last_n_transformer_blocks(clip_model, "vision_model.encoder.layer", unfreeze_vision_n)
+            if unf > 0:
+                clip_unfrozen_params = [p for p in clip_model.parameters() if p.requires_grad]
+                clip_model.train()
+                if is_main_process():
+                    print(f"Unfroze {unf} vision blocks, enabling gradient flow for CLIP vision encoder")
+
+        if unfreeze_text_n > 0:
+            unf = unfreeze_last_n_transformer_blocks(text_model, "text_model.encoder.layers", unfreeze_text_n)
+            if unf == 0:
+                unf = unfreeze_last_n_transformer_blocks(text_model, "text_model.encoder.layer", unfreeze_text_n)
+            if unf > 0:
+                text_unfrozen_params = [p for p in text_model.parameters() if p.requires_grad]
+                text_model.train()
+                if is_main_process():
+                    print(f"Unfroze {unf} text blocks, enabling gradient flow for CLIP text encoder")
+
     base_mapper = ImageToTextMapper(
         in_dim=in_dim, out_seq_len=out_seq_len, out_dim=out_dim,
         hidden_dim=hidden_dim, num_layers=num_layers
     ).to(device)
-
     mapper = nn.parallel.DistributedDataParallel(base_mapper, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
     # 4. Dataset + Sampler + split into train/val
@@ -136,7 +207,24 @@ def train_mapper_ddp(
     else:
         val_loader = None
 
-    optimizer = torch.optim.AdamW(mapper.parameters(), lr=lr, weight_decay=0.01)
+    # Build optimizer parameter groups: mapper + optionally unfrozen CLIP/text params
+    param_groups = [
+        {"params": mapper.parameters(), "lr": lr, "weight_decay": 0.01},
+    ]
+
+    # If we unfroze CLIP/text earlier, wrap them in DDP so gradients sync across ranks and add to optimizer
+    if clip_unfrozen_params:
+        # re-wrap clip_model in DDP so gradients are synchronized
+        clip_model = nn.parallel.DistributedDataParallel(clip_model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+        clip_group_lr = clip_lr if clip_lr and clip_lr > 0.0 else max(1e-6, lr * 0.05)
+        param_groups.append({"params": [p for p in clip_model.parameters() if p.requires_grad], "lr": clip_group_lr, "weight_decay": 1e-3})
+
+    if text_unfrozen_params:
+        text_model = nn.parallel.DistributedDataParallel(text_model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+        text_group_lr = clip_lr if clip_lr and clip_lr > 0.0 else max(1e-6, lr * 0.05)
+        param_groups.append({"params": [p for p in text_model.parameters() if p.requires_grad], "lr": text_group_lr, "weight_decay": 1e-3})
+
+    optimizer = torch.optim.AdamW(param_groups)
 
     # 5. Training loop
     best_val = float("inf")
@@ -151,15 +239,24 @@ def train_mapper_ddp(
             inputs = processor(images=images, return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
             img_inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            with torch.no_grad():
-                img_feats = clip_model.get_image_features(**img_inputs)
+            # compute image features; allow gradients only if CLIP vision was unfrozen
+            clip_trainable = any(p.requires_grad for p in clip_model.parameters())
+            if clip_trainable:
+                img_feats = clip_get_image_features(clip_model, **img_inputs)
+            else:
+                with torch.no_grad():
+                    img_feats = clip_get_image_features(clip_model, **img_inputs)
 
             tokenized = tokenizer(list(captions), padding="max_length", truncation=True,
                                   max_length=tokenizer.model_max_length, return_tensors="pt")
             input_ids = tokenized.input_ids.to(device)
             attention_mask = tokenized.attention_mask.to(device)
-            with torch.no_grad():
+            text_trainable = any(p.requires_grad for p in text_model.parameters())
+            if text_trainable:
                 text_embeds = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            else:
+                with torch.no_grad():
+                    text_embeds = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
             pred = mapper(img_feats)
             diff2 = (pred - text_embeds).pow(2).mean(dim=-1)
@@ -168,13 +265,53 @@ def train_mapper_ddp(
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(mapper.parameters(), 1.0)
+            # Clip gradients across all trainable parameter groups (mapper + any unfrozen CLIP params)
+            params_to_clip = [p for grp in optimizer.param_groups for p in grp.get("params", []) if p.requires_grad]
+            if params_to_clip:
+                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
 
             running_loss += loss.item()
             total_batches += 1
 
         avg_loss = running_loss / max(1, total_batches)
+
+        # If staged unfreeze is requested, perform unfreeze right AFTER completing the warm-up epoch
+        if staged_unfreeze and epoch == unfreeze_after_epoch:
+            if unfreeze_vision_n > 0:
+                unf = unfreeze_last_n_transformer_blocks(clip_model, "vision_model.encoder.layers", unfreeze_vision_n)
+                if unf == 0:
+                    unf = unfreeze_last_n_transformer_blocks(clip_model, "vision_model.encoder.layer", unfreeze_vision_n)
+                if unf > 0:
+                    clip_unfrozen_params = [p for p in clip_model.parameters() if p.requires_grad]
+                    clip_model.train()
+                    if is_main_process():
+                        print(f"(Staged) Unfroze {unf} vision blocks at epoch {epoch}")
+
+            if unfreeze_text_n > 0:
+                unf = unfreeze_last_n_transformer_blocks(text_model, "text_model.encoder.layers", unfreeze_text_n)
+                if unf == 0:
+                    unf = unfreeze_last_n_transformer_blocks(text_model, "text_model.encoder.layer", unfreeze_text_n)
+                if unf > 0:
+                    text_unfrozen_params = [p for p in text_model.parameters() if p.requires_grad]
+                    text_model.train()
+                    if is_main_process():
+                        print(f"(Staged) Unfroze {unf} text blocks at epoch {epoch}")
+
+            # Wrap newly-trainable CLIP modules in DDP and add optimizer groups
+            if clip_unfrozen_params:
+                clip_model = nn.parallel.DistributedDataParallel(clip_model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+                clip_group_lr = clip_lr if clip_lr and clip_lr > 0.0 else max(1e-6, lr * 0.05)
+                optimizer.add_param_group({"params": [p for p in clip_model.parameters() if p.requires_grad], "lr": clip_group_lr, "weight_decay": 1e-3})
+                if is_main_process():
+                    print(f"Added CLIP vision unfrozen params to optimizer (lr={clip_group_lr})")
+
+            if text_unfrozen_params:
+                text_model = nn.parallel.DistributedDataParallel(text_model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+                text_group_lr = clip_lr if clip_lr and clip_lr > 0.0 else max(1e-6, lr * 0.05)
+                optimizer.add_param_group({"params": [p for p in text_model.parameters() if p.requires_grad], "lr": text_group_lr, "weight_decay": 1e-3})
+                if is_main_process():
+                    print(f"Added CLIP text unfrozen params to optimizer (lr={text_group_lr})")
 
         # Validation loop (if available)
         val_loss = None
@@ -189,13 +326,23 @@ def train_mapper_ddp(
                     v_images = [img.convert("RGB") for img in v_images]
                     v_inputs = processor(images=v_images, return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
                     v_img_inputs = {k: v.to(device) for k, v in v_inputs.items()}
-                    v_img_feats = clip_model.get_image_features(**v_img_inputs)
+                    clip_trainable = any(p.requires_grad for p in clip_model.parameters())
+                    if clip_trainable:
+                        v_img_feats = clip_get_image_features(clip_model, **v_img_inputs)
+                    else:
+                        with torch.no_grad():
+                            v_img_feats = clip_get_image_features(clip_model, **v_img_inputs)
 
                     v_tokenized = tokenizer(list(v_captions), padding="max_length", truncation=True,
                                             max_length=tokenizer.model_max_length, return_tensors="pt")
                     v_input_ids = v_tokenized.input_ids.to(device)
                     v_attention_mask = v_tokenized.attention_mask.to(device)
-                    v_text_embeds = text_model(input_ids=v_input_ids, attention_mask=v_attention_mask).last_hidden_state
+                    text_trainable = any(p.requires_grad for p in text_model.parameters())
+                    if text_trainable:
+                        v_text_embeds = text_model(input_ids=v_input_ids, attention_mask=v_attention_mask).last_hidden_state
+                    else:
+                        with torch.no_grad():
+                            v_text_embeds = text_model(input_ids=v_input_ids, attention_mask=v_attention_mask).last_hidden_state
 
                     v_pred = mapper(v_img_feats)
                     v_diff2 = (v_pred - v_text_embeds).pow(2).mean(dim=-1)  # [B, L]
@@ -219,21 +366,59 @@ def train_mapper_ddp(
                 print(f"[Rank 0] Epoch {epoch}/{epochs} — avg masked MSE loss (train): {avg_loss:.6f}")
                 wandb.log({"epoch": epoch, "train_avg_loss": avg_loss})
                 ckpt_path = os.path.join(out_dir, f"mapper_epoch{epoch}.pth")
-                torch.save({
-                    "state_dict": mapper.module.state_dict(),
+                # Save mapper and (optionally) any unfrozen CLIP/text weights into a combined checkpoint
+                ckpt = {
+                    "mapper_state_dict": mapper.module.state_dict(),
                     "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
-                }, ckpt_path)
+                }
+                # include CLIP vision/state if it has trainable params
+                try:
+                    clip_has_trainable = any(p.requires_grad for p in (clip_model.module.parameters() if hasattr(clip_model, "module") else clip_model.parameters()))
+                except Exception:
+                    clip_has_trainable = False
+                if clip_has_trainable:
+                    ckpt["clip_state_dict"] = (clip_model.module.state_dict() if hasattr(clip_model, "module") else clip_model.state_dict())
+                try:
+                    text_has_trainable = any(p.requires_grad for p in (text_model.module.parameters() if hasattr(text_model, "module") else text_model.parameters()))
+                except Exception:
+                    text_has_trainable = False
+                if text_has_trainable:
+                    ckpt["text_state_dict"] = (text_model.module.state_dict() if hasattr(text_model, "module") else text_model.state_dict())
+
+                torch.save(ckpt, ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}")
+                try:
+                    wandb.save(ckpt_path)
+                except Exception:
+                    pass
             else:
                 print(f"[Rank 0] Epoch {epoch}/{epochs} — train_avg: {avg_loss:.6f}, val: {val_loss:.6f}")
                 wandb.log({"epoch": epoch, "train_avg_loss": avg_loss, "val_loss": val_loss})
                 # save every epoch + keep best
                 ckpt_path = os.path.join(out_dir, f"mapper_epoch{epoch}.pth")
-                torch.save({
-                    "state_dict": mapper.module.state_dict(),
+                ckpt = {
+                    "mapper_state_dict": mapper.module.state_dict(),
                     "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
-                }, ckpt_path)
+                }
+                try:
+                    clip_has_trainable = any(p.requires_grad for p in (clip_model.module.parameters() if hasattr(clip_model, "module") else clip_model.parameters()))
+                except Exception:
+                    clip_has_trainable = False
+                if clip_has_trainable:
+                    ckpt["clip_state_dict"] = (clip_model.module.state_dict() if hasattr(clip_model, "module") else clip_model.state_dict())
+                try:
+                    text_has_trainable = any(p.requires_grad for p in (text_model.module.parameters() if hasattr(text_model, "module") else text_model.parameters()))
+                except Exception:
+                    text_has_trainable = False
+                if text_has_trainable:
+                    ckpt["text_state_dict"] = (text_model.module.state_dict() if hasattr(text_model, "module") else text_model.state_dict())
+
+                torch.save(ckpt, ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}")
+                try:
+                    wandb.save(ckpt_path)
+                except Exception:
+                    pass
                 # save best
                 if val_loss < best_val:
                     best_val = val_loss
@@ -246,11 +431,29 @@ def train_mapper_ddp(
 
     if rank == 0:
         final_path = os.path.join(out_dir, "mapper_final.pth")
-        torch.save({
-            "state_dict": mapper.module.state_dict(),
+        final_ckpt = {
+            "mapper_state_dict": mapper.module.state_dict(),
             "config": {"in_dim": in_dim, "out_seq_len": out_seq_len, "out_dim": out_dim}
-        }, final_path)
+        }
+        try:
+            clip_has_trainable = any(p.requires_grad for p in (clip_model.module.parameters() if hasattr(clip_model, "module") else clip_model.parameters()))
+        except Exception:
+            clip_has_trainable = False
+        if clip_has_trainable:
+            final_ckpt["clip_state_dict"] = (clip_model.module.state_dict() if hasattr(clip_model, "module") else clip_model.state_dict())
+        try:
+            text_has_trainable = any(p.requires_grad for p in (text_model.module.parameters() if hasattr(text_model, "module") else text_model.parameters()))
+        except Exception:
+            text_has_trainable = False
+        if text_has_trainable:
+            final_ckpt["text_state_dict"] = (text_model.module.state_dict() if hasattr(text_model, "module") else text_model.state_dict())
+
+        torch.save(final_ckpt, final_path)
         print(f"✅ Training completed, saved final mapper to {final_path}")
+        try:
+            wandb.save(final_path)
+        except Exception:
+            pass
         wandb.finish()
         # writer.close()
 
@@ -261,13 +464,60 @@ def _load_mapper(mapper_path: str, device: torch.device):
     data = torch.load(mapper_path, map_location="cpu")
     cfg = data.get("config")
     mapper = ImageToTextMapper(in_dim=cfg["in_dim"], out_seq_len=cfg["out_seq_len"], out_dim=cfg["out_dim"])
-    state = data["state_dict"]
+    # support both legacy key "state_dict" and new combined key "mapper_state_dict"
+    if "mapper_state_dict" in data:
+        state = data["mapper_state_dict"]
+    elif "state_dict" in data:
+        state = data["state_dict"]
+    else:
+        raise KeyError(f"No mapper state found in checkpoint: {mapper_path}")
+
     # strip DataParallel prefix if present
-    if any(k.startswith("module.") for k in list(state.keys())):
+    if isinstance(state, dict) and any(k.startswith("module.") for k in list(state.keys())):
         state = {k.replace("module.", "", 1): v for k, v in state.items()}
     mapper.load_state_dict(state)
     mapper.to(device).eval()
     return mapper, cfg
+
+
+def _restore_clip_text_from_ckpt(mapper_path: str, clip_model: torch.nn.Module, text_model: torch.nn.Module, device: torch.device) -> bool:
+    """If the checkpoint at mapper_path contains fine-tuned CLIP or text state_dicts,
+    load them into the provided models. Returns True if any state was loaded.
+    """
+    loaded_any = False
+    data = torch.load(mapper_path, map_location="cpu")
+    # clip
+    if "clip_state_dict" in data:
+        clip_sd = data["clip_state_dict"]
+        # strip module. prefix if present
+        if isinstance(clip_sd, dict) and any(k.startswith("module.") for k in clip_sd.keys()):
+            clip_sd = {k.replace("module.", "", 1): v for k, v in clip_sd.items()}
+        try:
+            clip_model.load_state_dict(clip_sd)
+            clip_model.to(device)
+            loaded_any = True
+            if is_main_process():
+                print(f"Loaded fine-tuned CLIP vision weights from {mapper_path}")
+        except Exception as e:
+            if is_main_process():
+                print(f"Warning: failed to load clip_state_dict from {mapper_path}: {e}")
+
+    # text
+    if "text_state_dict" in data:
+        text_sd = data["text_state_dict"]
+        if isinstance(text_sd, dict) and any(k.startswith("module.") for k in text_sd.keys()):
+            text_sd = {k.replace("module.", "", 1): v for k, v in text_sd.items()}
+        try:
+            text_model.load_state_dict(text_sd)
+            text_model.to(device)
+            loaded_any = True
+            if is_main_process():
+                print(f"Loaded fine-tuned CLIP text weights from {mapper_path}")
+        except Exception as e:
+            if is_main_process():
+                print(f"Warning: failed to load text_state_dict from {mapper_path}: {e}")
+
+    return loaded_any
 
 
 def _prepare_image(img_path: str):
@@ -294,6 +544,7 @@ def generate_variation(
     seed: int = 42,
     use_source_latents: bool = False,  # keep default for backward compat
     variations: int = 3,               # <-- added parameter
+    use_checkpoint_clip: bool = False,
 ) -> List[str]:
     """
     Generate image variation(s) using the Stable Diffusion pipeline.
@@ -307,14 +558,26 @@ def generate_variation(
     pipe_dtype = torch.float16 if device.type == "cuda" else torch.float32
 
     # load CLIP and text models (kept in float32 for stability)
-    processor = CLIPProcessor.from_pretrained(clip_model_name, use_fast=True)
+    processor = CLIPProcessor.from_pretrained(clip_model_name)
     clip_model = CLIPModel.from_pretrained(clip_model_name).to(device).eval()
     tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
     text_model = CLIPTextModel.from_pretrained(clip_model_name).to(device).eval()
     for p in list(clip_model.parameters()) + list(text_model.parameters()):
         p.requires_grad = False
 
+    # Optionally restore fine-tuned CLIP/text weights from the checkpoint if provided
+    if use_checkpoint_clip:
+        try:
+            restored = _restore_clip_text_from_ckpt(mapper_path, clip_model, text_model, device)
+            if restored and is_main_process():
+                print("Using CLIP/Text weights restored from checkpoint for generation.")
+        except Exception as e:
+            if is_main_process():
+                print(f"Warning: could not restore CLIP/text from checkpoint: {e}")
+
     # load mapper checkpoint
+    if not os.path.exists(mapper_path):
+        raise FileNotFoundError(f"Mapper checkpoint not found: {mapper_path}")
     mapper, cfg = _load_mapper(mapper_path, device=torch.device("cpu"))
     mapper.to(device).eval()
 
@@ -329,9 +592,22 @@ def generate_variation(
 
     # compute mapped conditioning and uncond embedding
     with torch.no_grad():
-        clip_inputs = processor(images=pil_img, return_tensors="pt")
+        # Use same preprocessing as training (resize/center-crop/normalize) but be robust
+        # across transformers versions: some image processors don't accept extra kwargs
+        try:
+            clip_inputs = processor(images=[pil_img], return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
+        except Exception:
+            try:
+                clip_inputs = processor(images=[pil_img], return_tensors="pt")
+            except Exception:
+                # Fall back to calling image_processor / feature_extractor directly
+                img_proc = getattr(processor, "image_processor", None) or getattr(processor, "feature_extractor", None)
+                if img_proc is None:
+                    raise
+                clip_inputs = img_proc(images=[pil_img], return_tensors="pt")
         clip_inputs = {k: v.to(device) for k, v in clip_inputs.items()}
-        img_feats = clip_model.get_image_features(**clip_inputs)  # float32
+        # safe call in case clip_model was wrapped in DDP
+        img_feats = clip_get_image_features(clip_model, **clip_inputs)  # float32
         mapped = mapper(img_feats)  # [1, L, H] float32
 
         uncond_tokens = tokenizer([""], padding="max_length", truncation=True,
@@ -341,8 +617,9 @@ def generate_variation(
 
     # align dtype/device for pipeline UNet
     target_dtype = unet.dtype
-    mapped = mapped.to(device=device, dtype=target_dtype)
-    uncond_emb = uncond_emb.to(device=device, dtype=target_dtype)
+    # Ensure contiguous, correct device and dtype expected by the pipeline
+    mapped = mapped.contiguous().to(device=device, dtype=target_dtype)
+    uncond_emb = uncond_emb.contiguous().to(device=device, dtype=target_dtype)
 
     # prepare latents (either encoded source or random base — we'll sample per-variation)
     with torch.no_grad():
@@ -352,6 +629,8 @@ def generate_variation(
     out_paths: List[str] = []
     for i in range(variations):
         gen_seed = int(seed) + i
+        if is_main_process():
+            print(f"Generating variation {i} with seed {gen_seed}")
         generator = torch.Generator(device=device).manual_seed(gen_seed)
 
         if use_source_latents:
@@ -360,15 +639,19 @@ def generate_variation(
             latents = torch.randn_like(latents_orig, device=device, dtype=latents_orig.dtype)
 
         # Run pipeline (it will perform denoising + decode)
-        images = pipe(
-            prompt_embeds=mapped,
-            negative_prompt_embeds=uncond_emb,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            latents=latents,
-            generator=generator,
-            output_type="pil",
-        ).images
+        try:
+            images = pipe(
+                prompt_embeds=mapped,
+                negative_prompt_embeds=uncond_emb,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                latents=latents,
+                generator=generator,
+                output_type="pil",
+            ).images
+        except Exception as e:
+            # Surface an informative error for debugging
+            raise RuntimeError(f"Stable Diffusion pipeline failed for variation {i} (seed={gen_seed}): {e}")
 
         img_out = images[0]
         out_name = f"variation_{i}_seed{gen_seed}.png"
@@ -407,6 +690,11 @@ def parse_cli():
                    help="If set, encode the input image to latents (img2img). Otherwise start from random latents (decoupled).")
     p.add_argument("--variations", type=int, default=3, help="Number of variants to generate")
     p.add_argument("--val_fraction", type=float, default=0.1, help="Fraction of data to use for validation (0-1)")
+    p.add_argument("--unfreeze_vision_n", type=int, default=0, help="Number of last vision transformer blocks to unfreeze in CLIP")
+    p.add_argument("--unfreeze_text_n", type=int, default=0, help="Number of last text transformer blocks to unfreeze in CLIP text encoder")
+    p.add_argument("--clip_lr", type=float, default=0.0, help="Learning rate for unfrozen CLIP parameter groups (if 0, a small default is used)")
+    p.add_argument("--unfreeze_after_epoch", type=int, default=0, help="If >0, delay unfreezing until after this many epochs (warm-up). 0 = unfreeze immediately)")
+    p.add_argument("--use_checkpoint_clip", action="store_true", help="(gen mode only) if set, load fine-tuned CLIP/text weights from the mapper checkpoint when generating")
     return p.parse_args()
 
 
@@ -415,6 +703,11 @@ def main():
     if cli.mode == "train":
         n_gpus = torch.cuda.device_count()
         print(f"Launching DDP training on {n_gpus} GPUs")
+        # pass unfreeze flags via environment so child processes spawned by mp.spawn can read them
+        os.environ["UNFREEZE_VISION_N"] = str(cli.unfreeze_vision_n)
+        os.environ["UNFREEZE_TEXT_N"] = str(cli.unfreeze_text_n)
+        os.environ["CLIP_LR"] = str(cli.clip_lr)
+        os.environ["UNFREEZE_AFTER_EPOCH"] = str(cli.unfreeze_after_epoch)
         mp.spawn(
             train_mapper_ddp,
             args=(
@@ -448,6 +741,7 @@ def main():
             strength=cli.strength,
             use_source_latents=cli.use_source_latents,
             variations=cli.variations,   # <-- pass CLI value here
+            use_checkpoint_clip=cli.use_checkpoint_clip,
         )
 
 if __name__ == "__main__":
