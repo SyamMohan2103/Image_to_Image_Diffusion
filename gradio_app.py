@@ -7,6 +7,9 @@ import torch
 from PIL import Image
 
 from run_mapper import generate_variation as run_generate_variation
+# import internal helpers to warm/load checkpoint weights
+from run_mapper import _load_mapper, _restore_clip_text_from_ckpt
+from transformers import CLIPModel, CLIPTextModel
 
 # configuration
 CLIP_NAME = "openai/clip-vit-large-patch14"
@@ -16,6 +19,34 @@ OUT_DIR = Path("/home1/koustav/Image_to_Image_Diffusion/gradio_out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Warm-load mapper + CLIP/text weights into cache / memory to reduce per-request latency.
+# This loads onto CPU to avoid consuming GPU at startup; run_generate_variation will still
+# instantiate device-specific models when invoked by a request.
+try:
+    print("Warming models: loading mapper checkpoint and CLIP/text (cpu)...")
+    if MAPPER_PATH.exists():
+        try:
+            _load_mapper(str(MAPPER_PATH), device=torch.device("cpu"))
+        except Exception as e:
+            print(f"Warning: failed to load mapper for warm-up: {e}")
+
+        # instantiate CLIP models to populate HF cache and optionally restore finetuned weights
+        try:
+            clip_warm = CLIPModel.from_pretrained(CLIP_NAME)
+            text_warm = CLIPTextModel.from_pretrained(CLIP_NAME)
+            try:
+                _restore_clip_text_from_ckpt(str(MAPPER_PATH), clip_warm, text_warm, device=torch.device("cpu"))
+                print("Restored CLIP/text weights from mapper checkpoint (warm).")
+            except Exception:
+                # not fatal — checkpoint may not contain clip/text
+                pass
+        except Exception as e:
+            print(f"Warning: could not instantiate CLIP models for warm-up: {e}")
+    else:
+        print(f"Warning: mapper checkpoint not found at {MAPPER_PATH}; first request will load models.")
+except Exception as e:
+    print(f"Model warm-up skipped: {e}")
 
 
 def _call_pipeline_and_load(
@@ -27,6 +58,7 @@ def _call_pipeline_and_load(
     variations: int,
     seed: int,
     use_source_latents: bool = False,
+    use_checkpoint_clip: bool = True,
 ) -> List[Image.Image]:
     if image is None:
         return []
@@ -49,6 +81,7 @@ def _call_pipeline_and_load(
         seed=int(seed),
         use_source_latents=bool(use_source_latents),
         variations=int(variations),
+        use_checkpoint_clip=bool(use_checkpoint_clip),
     )
 
     # open generated images and return as list of PIL images
@@ -69,7 +102,7 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         image_input = gr.Image(type="pil", label="Input image")
-        gallery = gr.Gallery(label="Generated variants", columns=[2], height=512)
+        gallery = gr.Gallery(label="Generated variants", columns=2, height=512)
 
     prompt = gr.Textbox(label="Optional text prompt", value="")
     with gr.Row():
@@ -86,10 +119,16 @@ with gr.Blocks() as demo:
         info="If enabled, encode the input image to latents (img2img). Otherwise start from random latents (more diverse outputs).",
     )
 
+    use_ckpt_clip = gr.Checkbox(
+        label="Use CLIP/Text weights from mapper checkpoint",
+        value=True,
+        info="If enabled, attempt to load CLIP/text weights stored inside the mapper checkpoint for generation.",
+    )
+
     run_btn = gr.Button("Generate")
     run_btn.click(
         fn=_call_pipeline_and_load,
-        inputs=[image_input, prompt, guidance, strength, steps, variations, seed, use_src_latents],
+        inputs=[image_input, prompt, guidance, strength, steps, variations, seed, use_src_latents, use_ckpt_clip],
         outputs=gallery,
     )
 
