@@ -746,7 +746,9 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # TODO: train the model with a different loss
-    # TODO: check the cosine similarity between the 2 embeddings
-    # TODO: increase the complexity of the mapper model
-    # TODO: unfreeze some layers of CLIP model
+    # DONE: train the model with a different loss
+    # DONE: check the cosine similarity between the 2 embeddings
+    # DONE: increase the complexity of the mapper model
+    # DONE: unfreeze some layers of CLIP model
+    # TODO: IP Adapter embeddings comparison with mapper embeddings
+    # TODO: get the FID between the image generated from text prompt vs image generated from mapped embeddings
