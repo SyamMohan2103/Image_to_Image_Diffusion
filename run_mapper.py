@@ -592,7 +592,7 @@ def generate_variation(
 
     # compute mapped conditioning and uncond embedding
     with torch.no_grad():
-        # Use same preprocessing as training (resize/center-crop/normalize) but be robust
+        # Use same preprocessing as training (resize/center-crop/normalize)
         # across transformers versions: some image processors don't accept extra kwargs
         try:
             clip_inputs = processor(images=[pil_img], return_tensors="pt", do_normalize=True, do_resize=True, do_center_crop=True)
