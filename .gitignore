@@ -231,3 +231,5 @@ laion_metadata_kp.jsonl
 .todo
 .gradio/
 *.csv
+fid_true_out/
+fid_true_out_clip/
