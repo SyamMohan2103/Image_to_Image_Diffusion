@@ -4,6 +4,8 @@ import os
 import random
 import numpy as np
 from diffusers import StableDiffusionPipeline
+import sys
+import subprocess
 from pathlib import Path
 from typing import List
 
@@ -69,11 +71,91 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use_csv_for_true", action="store_true", help="If set, sample true images from the provided CSV (requires --csv). Otherwise sample from image_root dir.")
     p.add_argument("--caption_col", default="caption", help="CSV column name for caption text")
+    # multi-GPU sharding options
+    p.add_argument("--gpu_ids", type=str, default=None, help="Comma-separated list of GPU IDs to shard generation across; enables orchestrator mode")
+    p.add_argument("--child_generate_only", action="store_true", help="Child mode: only perform generation for provided rows JSON and exit")
+    p.add_argument("--rows_json", type=str, default=None, help="Path to JSON file containing rows [{caption, image, index}] for child mode")
+    # NEW: control which generations to run
+    p.add_argument("--gen_mode", choices=["both", "sd", "mapper", "none"], default="both",
+                   help="Which generation(s) to run: 'sd' (caption->image), 'mapper' (mapper+SD), 'both', or 'none' (reuse existing only)")
     args = p.parse_args()
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # Child mode: perform only generation for provided rows and exit
+    if args.child_generate_only:
+        if not args.rows_json:
+            raise RuntimeError("--child_generate_only requires --rows_json")
+        rows = json.loads(Path(args.rows_json).read_text())
+        run_sd = args.gen_mode in ("both", "sd")
+        run_mapper = args.gen_mode in ("both", "mapper")
+
+        # lazy pipeline init
+        pipe = None
+        if run_sd:
+            pipe = StableDiffusionPipeline.from_pretrained(
+                args.sd_model, torch_dtype=(torch.float16 if device.type == "cuda" else torch.float32)
+            ).to(device)
+
+        text_gen_dir = out_root / "generated_from_text"
+        mapper_gen_dir = out_root / "generated_from_mapper"
+        text_gen_dir.mkdir(parents=True, exist_ok=True)
+        mapper_gen_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Child] Starting generation for {len(rows)} rows... (gen_mode={args.gen_mode})")
+        for i, r in enumerate(rows):
+            caption = r["caption"]
+            image_fname = r["image"]
+            i_idx = r.get("index", i)
+            src_img_path = Path(args.image_root) / image_fname
+            if not src_img_path.exists():
+                print(f"[Child] Warning: source image not found: {src_img_path}; skipping row index {i_idx}")
+                continue
+
+            # caption side
+            subdir_text = text_gen_dir / f"row{i_idx}"
+            subdir_text.mkdir(parents=True, exist_ok=True)
+            existing = [str(p) for p in subdir_text.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+            if len(existing) >= args.variations:
+                print(f"[Child] Reusing {args.variations} existing caption images for row {i_idx}")
+            elif run_sd:
+                _ = generate_from_caption(pipe, caption, subdir_text, variations=args.variations, seed=args.seed + i_idx)
+            else:
+                print(f"[Child] Skipping SD generation for row {i_idx} per gen_mode={args.gen_mode}")
+
+            # mapper side
+            subdir_mapper = mapper_gen_dir / f"row{i_idx}"
+            subdir_mapper.mkdir(parents=True, exist_ok=True)
+            existing_map = [str(p) for p in subdir_mapper.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+            if len(existing_map) >= args.variations:
+                print(f"[Child] Reusing {args.variations} existing mapper images for row {i_idx}")
+            elif run_mapper:
+                _ = run_generate_variation(
+                    mapper_path=args.mapper,
+                    clip_model_name="openai/clip-vit-large-patch14",
+                    sd_model_name=args.sd_model,
+                    input_image_path=str(src_img_path),
+                    out_dir=str(subdir_mapper),
+                    device=device,
+                    num_inference_steps=50,
+                    guidance_scale=7.5,
+                    variations=args.variations,
+                    seed=args.seed + i_idx,
+                    use_source_latents=False,
+                )
+            else:
+                print(f"[Child] Skipping mapper generation for row {i_idx} per gen_mode={args.gen_mode}")
+        print("[Child] Generation complete. Exiting child process.")
+        return
+
+    # Orchestrator: detect if multi-GPU sharding requested
+    gpu_list = None
+    if args.gpu_ids is not None:
+        gpu_list = [g.strip() for g in args.gpu_ids.split(',') if g.strip() != ""]
+        if len(gpu_list) == 0:
+            raise RuntimeError("--gpu_ids provided but empty after parsing")
+        print(f"Using multi-GPU sharding across GPUs: {gpu_list}")
 
     # 1) sample true distribution images
     print("Sampling true images for LAION true distribution...")
@@ -98,48 +180,96 @@ def main():
         raise RuntimeError("Caption generation requires --csv pointing to filtered_metadata_parallel.csv")
     print(f"Sampling {args.num_rows} caption rows to generate text-based images...")
     rows = read_csv_subset(args.csv, args.num_rows, args.caption_col, args.image_col)
-    # load SD pipeline for caption generation
-    
+
+    # If orchestrator mode, shard rows and spawn child processes for generation
+    if gpu_list is not None:
+        # attach stable indices
+        for i, r in enumerate(rows):
+            r["index"] = i
+        def split_chunks(lst, n):
+            k, m = divmod(len(lst), n)
+            return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+        shards = split_chunks(rows, len(gpu_list))
+        print(f"Spawning {len(gpu_list)} child processes for generation shards...")
+        procs = []
+        for shard_idx, (gpu_id, shard_rows) in enumerate(zip(gpu_list, shards)):
+            shard_file = out_root / f"rows_shard_{shard_idx}.json"
+            shard_file.write_text(json.dumps(shard_rows))
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu_id
+            cmd = [sys.executable, os.path.abspath(__file__),
+                   "--image_root", args.image_root,
+                   "--image_col", args.image_col,
+                   "--true_sample_size", str(args.true_sample_size),
+                   "--num_rows", str(args.num_rows),
+                   "--variations", str(args.variations),
+                   "--mapper", args.mapper,
+                   "--sd_model", args.sd_model,
+                   "--out_dir", str(out_root),
+                   "--device", "cuda",
+                   "--batch_size", str(args.batch_size),
+                   "--seed", str(args.seed),
+                   "--caption_col", args.caption_col,
+                   "--rows_json", str(shard_file),
+                   "--gen_mode", args.gen_mode,
+                   "--child_generate_only"
+                   ]
+            print(f"Launching child on GPU {gpu_id} with {len(shard_rows)} rows...")
+            procs.append(subprocess.Popen(cmd, env=env))
+        # wait for children
+        for p_child in procs:
+            rc = p_child.wait()
+            if rc != 0:
+                raise RuntimeError(f"A child process exited with code {rc}")
+        print("All child generation processes completed.")
+
+    # load SD pipeline for caption generation (parent may not need it if all images exist; kept for completeness)
     pipe = StableDiffusionPipeline.from_pretrained(args.sd_model, torch_dtype=(torch.float16 if device.type == "cuda" else torch.float32)).to(device)
     text_gen_dir = out_root / "generated_from_text"
     text_gen_dir.mkdir(parents=True, exist_ok=True)
     all_text_paths: List[str] = []
-    print("Generating caption->image variants...")
+    print(f"Collecting caption->image variants (gen_mode={args.gen_mode})...")
+    pipe = None  # lazy init
     for i, r in enumerate(rows):
         caption = r["caption"]
-        subdir = text_gen_dir / f"row{i}"
+        i_idx = r.get("index", i)
+        subdir = text_gen_dir / f"row{i_idx}"
         subdir.mkdir(parents=True, exist_ok=True)
-        # check for existing generated images and skip generation if present
-        existing = [str(p) for p in subdir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+        existing = sorted([str(p) for p in subdir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}])
         if len(existing) >= args.variations:
-            # sort for deterministic order
-            existing = sorted(existing)
             cap_paths = existing[: args.variations]
-            print(f"Reusing {len(cap_paths)} existing text-generated images for row {i} from {subdir}")
+        elif run_sd_parent:
+            if pipe is None:
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    args.sd_model, torch_dtype=(torch.float16 if device.type == "cuda" else torch.float32)
+                ).to(device)
+            cap_paths = generate_from_caption(pipe, caption, subdir, variations=args.variations, seed=args.seed + i_idx)
         else:
-            cap_paths = generate_from_caption(pipe, caption, subdir, variations=args.variations, seed=args.seed + i)
+            # skip generation, reuse whatever exists (may be < variations)
+            cap_paths = existing[: args.variations]
+            if len(cap_paths) < args.variations:
+                print(f"Warning: SD images missing for row {i_idx} and gen_mode={args.gen_mode}; proceeding with {len(cap_paths)} images")
         all_text_paths.extend(cap_paths)
 
-    # 3) generate images using mapper + SD from source images
-    print("Generating mapper->image variants...")
+    # Collect/generate mapper->image variants
+    run_mapper_parent = args.gen_mode in ("both", "mapper")
+    print(f"Collecting mapper->image variants (gen_mode={args.gen_mode})...")
     mapper_gen_dir = out_root / "generated_from_mapper"
     mapper_gen_dir.mkdir(parents=True, exist_ok=True)
     all_mapper_paths: List[str] = []
     for i, r in enumerate(rows):
         image_fname = r["image"]
+        i_idx = r.get("index", i)
         src_img_path = Path(args.image_root) / image_fname
         if not src_img_path.exists():
             print(f"Warning: source image not found: {src_img_path}; skipping")
             continue
-        subdir = mapper_gen_dir / f"row{i}"
+        subdir = mapper_gen_dir / f"row{i_idx}"
         subdir.mkdir(parents=True, exist_ok=True)
-        # check for existing mapper-generated images and skip generation if present
-        existing_map = [str(p) for p in subdir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+        existing_map = sorted([str(p) for p in subdir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}])
         if len(existing_map) >= args.variations:
-            existing_map = sorted(existing_map)
             mapper_paths = existing_map[: args.variations]
-            print(f"Reusing {len(mapper_paths)} existing mapper-generated images for row {i} from {subdir}")
-        else:
+        elif run_mapper_parent:
             mapper_paths = run_generate_variation(
                 mapper_path=args.mapper,
                 clip_model_name="openai/clip-vit-large-patch14",
@@ -150,9 +280,13 @@ def main():
                 num_inference_steps=50,
                 guidance_scale=7.5,
                 variations=args.variations,
-                seed=args.seed + i,
-                use_source_latents=False,  # decoupled
+                seed=args.seed + i_idx,
+                use_source_latents=False,
             )
+        else:
+            mapper_paths = existing_map[: args.variations]
+            if len(mapper_paths) < args.variations:
+                print(f"Warning: mapper images missing for row {i_idx} and gen_mode={args.gen_mode}; proceeding with {len(mapper_paths)} images")
         all_mapper_paths.extend(mapper_paths)
 
     # 4) compute activations & stats for generated sets and compute FID(true, gen)
