@@ -20,9 +20,6 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Warm-load mapper + CLIP/text weights into cache / memory to reduce per-request latency.
-# This loads onto CPU to avoid consuming GPU at startup; run_generate_variation will still
-# instantiate device-specific models when invoked by a request.
 try:
     print("Warming models: loading mapper checkpoint and CLIP/text (cpu)...")
     if MAPPER_PATH.exists():
@@ -51,7 +48,7 @@ except Exception as e:
 
 def _call_pipeline_and_load(
     image: Image.Image,
-    prompt: str,
+    # prompt: str,
     guidance: float,
     strength: float,
     steps: int,
@@ -98,13 +95,14 @@ def _call_pipeline_and_load(
 
 # --- gradio UI ---------------------------------------------------------------
 with gr.Blocks() as demo:
-    gr.Markdown("# Image-to-Image Variants with Mapper (pipeline)")
+    gr.Markdown("# Image-to-Image Diffusion")
 
     with gr.Row():
         image_input = gr.Image(type="pil", label="Input image")
         gallery = gr.Gallery(label="Generated variants", columns=2, height=512)
 
-    prompt = gr.Textbox(label="Optional text prompt", value="")
+    # prompt = gr.Textbox(label="Optional text prompt", value="")
+    # prompt = None
     with gr.Row():
         guidance = gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Guidance scale")
         strength = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Strength")
@@ -128,9 +126,9 @@ with gr.Blocks() as demo:
     run_btn = gr.Button("Generate")
     run_btn.click(
         fn=_call_pipeline_and_load,
-        inputs=[image_input, prompt, guidance, strength, steps, variations, seed, use_src_latents, use_ckpt_clip],
+        inputs=[image_input, guidance, strength, steps, variations, seed, use_src_latents, use_ckpt_clip],
         outputs=gallery,
     )
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch(debug=True)

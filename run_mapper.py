@@ -138,9 +138,6 @@ def train_mapper_ddp(
     # 3. Init CLIP + Mapper
     processor, clip_model, tokenizer, text_model, in_dim, out_seq_len, out_dim = init_models(clip_model_name, device)
 
-    # Read unfreeze settings from environment (set by launcher). We support staged unfreeze
-    # controlled by UNFREEZE_AFTER_EPOCH. If UNFREEZE_AFTER_EPOCH > 0, we defer unfreezing until
-    # after that epoch (warm-up). If 0 (default), unfreeze immediately as before.
     unfreeze_vision_n = int(os.environ.get("UNFREEZE_VISION_N", "0"))
     unfreeze_text_n = int(os.environ.get("UNFREEZE_TEXT_N", "0"))
     clip_lr = float(os.environ.get("CLIP_LR", "0.0"))
@@ -150,7 +147,7 @@ def train_mapper_ddp(
     clip_unfrozen_params = []
     text_unfrozen_params = []
 
-    # If no staged warm-up requested, perform the unfreeze immediately (previous behavior)
+    # If no staged warm-up requested, perform the unfreeze immediately
     if not staged_unfreeze:
         if unfreeze_vision_n > 0:
             unf = unfreeze_last_n_transformer_blocks(clip_model, "vision_model.encoder.layers", unfreeze_vision_n)
@@ -186,7 +183,6 @@ def train_mapper_ddp(
     val_len = max(1, int(total_len * float(val_fraction))) if total_len > 1 else 0
     train_len = total_len - val_len
     if val_len <= 0:
-        # no validation set (tiny dataset) -> use training only
         train_dataset = dataset
         val_dataset = None
     else:
@@ -313,7 +309,6 @@ def train_mapper_ddp(
                 if is_main_process():
                     print(f"Added CLIP text unfrozen params to optimizer (lr={text_group_lr})")
 
-        # Validation loop (if available)
         val_loss = None
         if val_loader is not None:
             mapper.eval()
@@ -746,9 +741,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # DONE: train the model with a different loss
-    # DONE: check the cosine similarity between the 2 embeddings
-    # DONE: increase the complexity of the mapper model
-    # DONE: unfreeze some layers of CLIP model
-    # TODO: IP Adapter embeddings comparison with mapper embeddings
-    # TODO: get the FID between the image generated from text prompt vs image generated from mapped embeddings
