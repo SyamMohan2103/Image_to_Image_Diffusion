@@ -233,3 +233,5 @@ laion_metadata_kp.jsonl
 *.csv
 fid_true_out/
 fid_true_out_clip/
+input_images/
+
