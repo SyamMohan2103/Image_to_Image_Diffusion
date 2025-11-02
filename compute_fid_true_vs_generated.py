@@ -224,6 +224,8 @@ def main():
         print("All child generation processes completed.")
 
     # load SD pipeline for caption generation (parent may not need it if all images exist; kept for completeness)
+    # decide whether parent should run SD generation based on gen_mode
+    run_sd_parent = args.gen_mode in ("both", "sd")
     pipe = StableDiffusionPipeline.from_pretrained(args.sd_model, torch_dtype=(torch.float16 if device.type == "cuda" else torch.float32)).to(device)
     text_gen_dir = out_root / "generated_from_text"
     text_gen_dir.mkdir(parents=True, exist_ok=True)
