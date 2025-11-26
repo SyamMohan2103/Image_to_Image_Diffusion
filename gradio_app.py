@@ -14,8 +14,8 @@ from transformers import CLIPModel, CLIPTextModel
 # configuration
 CLIP_NAME = "openai/clip-vit-large-patch14"
 SD_NAME = "runwayml/stable-diffusion-v1-5"
-MAPPER_PATH = Path("/home1/koustav/Image_to_Image_Diffusion/mapper_ckpt_new/mapper_epoch22.pth")
-OUT_DIR = Path("/home1/koustav/Image_to_Image_Diffusion/gradio_out")
+MAPPER_PATH = Path("/home/subhankar/koustav/Image_to_Image_Diffusion/mapper_model/mapper_final.pth")
+OUT_DIR = Path("/home/subhankar/koustav/Image_to_Image_Diffusion/gradio_out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
