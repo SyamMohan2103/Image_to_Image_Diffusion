@@ -46,7 +46,7 @@ def _prepare_image(img_path: str):
     t = preprocess(img).unsqueeze(0)  # [1,C,H,W]
     return img, t
 
-def generate_variation(
+def get_image_embeddings(
     mapper_path: str,
     clip_model_name: str,
     sd_model_name: str,
@@ -146,7 +146,7 @@ def generate_variation(
 if __name__ == "__main__":
 
 
-    mapped, negative_embeds = generate_variation(
+    mapped, negative_embeds = get_image_embeddings(
         mapper_path=str(MAPPER_PATH),
         clip_model_name=CLIP_NAME,
         sd_model_name=SD_NAME,
@@ -165,36 +165,12 @@ if __name__ == "__main__":
     pipe = TextToVideoSDPipeline.from_pretrained(
     "damo-vilab/text-to-video-ms-1.7b", torch_dtype=torch.float16, variant="fp16"
     )
-    # pipe.enable_model_cpu_offload()
     pipe.to("cuda:3")
 
-    # # Load the text-to-video model
-    # model_id = "cerspense/zeroscope_v2_576w"  # Text-to-video model
-    # pipe = DiffusionPipeline.from_pretrained(
-    #     model_id,
-    #     torch_dtype=torch.float16,
-    # )
-    # pipe.to("cuda:3")
-
-    # # Optional: Use faster scheduler
-    # pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-
-    # print(f"Custom embedding shape: {mapped.shape}")
-
-    # # For classifier-free guidance, also convert negative embedding
-    # # negative_embedding = torch.randn(1, 77, 1024, dtype=torch.float16, device="cuda:2")
-    # # negative_embedding = torch.cat([negative_1024_embedding], dim=-1)
 
     # # Generate video using custom embeddings
     video_frames = pipe(
-        # prompt="Spiderman is surfing",
         prompt_embeds=mapped,
-        # negative_prompt_embeds=negative_embeds,
-        # num_inference_steps=25,
-        # num_frames=24,
-        # height=256,
-        # width=256,
-        # guidance_scale=9.0,
     ).frames[0]
 
     # Save video
