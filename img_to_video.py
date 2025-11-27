@@ -150,7 +150,7 @@ if __name__ == "__main__":
         mapper_path=str(MAPPER_PATH),
         clip_model_name=CLIP_NAME,
         sd_model_name=SD_NAME,
-        input_image_path="/home/subhankar/koustav/Image_to_Image_Diffusion/men.jpg",
+        input_image_path="/home/subhankar/koustav/Image_to_Image_Diffusion/wind.webp",
         out_dir=str(OUT_DIR),
         device=torch.device("cuda:3"),
         num_inference_steps=50,
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     ).frames[0]
 
     # Save video
-    export_to_video(video_frames, "men.mp4")
+    export_to_video(video_frames, "wind1.mp4")
 
     print("Video generated successfully!")
     print(f"Video shape: {len(video_frames)} frames")
